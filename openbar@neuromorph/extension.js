@@ -383,19 +383,25 @@ export default class Openbar extends Extension {
                         this.applySectionStyles(sectionList, add);
 
                         const msgHbox = msgbox.get_child_at_index(1); // hbox at botton for dnd and clear buttons
-                        if(this.gnomeVersion < 49) {
-                            const dndBtn = msgHbox.get_child_at_index(1);
-                            this.applyMenuClass(dndBtn, add);
-                            const toggleSwitch = dndBtn.get_child_at_index(0);
-                            this.applyMenuClass(toggleSwitch, add);
-                            const clearBtn = msgHbox.get_child_at_index(2);
-                        }
-                        else {
-                            const clearBtn = msgHbox.get_child_at_index(1);
+                        let clearBtn = null;
+                        if (msgHbox && msgHbox.get_child_at_index) {
+                            if (this.gnomeVersion < 49) {
+                                const dndBtn = msgHbox.get_child_at_index(1);
+                                if (dndBtn) {
+                                    this.applyMenuClass(dndBtn, add);
+                                    if (dndBtn.get_child_at_index) {
+                                        const toggleSwitch = dndBtn.get_child_at_index(0);
+                                        if (toggleSwitch) this.applyMenuClass(toggleSwitch, add);
+                                    }
+                                }
+                                clearBtn = msgHbox.get_children && msgHbox.get_children().length > 2 ? msgHbox.get_child_at_index(2) : null;
+                            } else {
+                                clearBtn = msgHbox.get_children && msgHbox.get_children().length > 1 ? msgHbox.get_child_at_index(1) : null;
+                            }
                         }
                         this.applyMenuClass(clearBtn, add);
 
-                        const vbox = hbox.get_child_at_index(1); // Right Pane/Section vbox for calendar etc
+                        const vbox = hbox && hbox.get_child_at_index ? hbox.get_child_at_index(1) : null; // Right Pane/Section vbox for calendar etc
                         vbox.get_children().forEach(item => {
                             this.applyMenuClass(item, add);
                             item.get_children().forEach(child => {
