@@ -44,6 +44,18 @@ function dlog(...args) {
 // Auto-Theming: Select colors from color palette as per theme & dark/light mode (Gets called separately for dark/light)
 // Manipulate colors, as needed, for better contrast and readability (except for 'True Color')
 export function autoApplyBGPalette(obar, requestMode) {
+    const wasPaused = obar._settings.get_boolean('pause-reload');
+    try {
+        autoApplyBGPaletteImpl(obar, requestMode);
+    }
+    finally {
+        // If something threw half-way, do not leave stylesheet reloading paused
+        if(!wasPaused && obar._settings?.get_boolean('pause-reload'))
+            obar._settings.set_boolean('pause-reload', false);
+    }
+}
+
+function autoApplyBGPaletteImpl(obar, requestMode) {
     const importExport = obar._settings.get_boolean('import-export');
     if(importExport)
         return;
@@ -51,8 +63,6 @@ export function autoApplyBGPalette(obar, requestMode) {
     // dlog('autoApply caller trace ' + autoApplyBGPalette.caller, requestMode);
 
     // Pause stylesheet reloading, while auto-theme settings are updated, to prevent multiple style reloads
-    obar._settings.set_boolean('pause-reload', true);
-
     let themeDark = obar._settings.get_string('autotheme-dark');
     let themeLight = obar._settings.get_string('autotheme-light');
     let currentMode = obar._intSettings.get_string('color-scheme');
@@ -60,6 +70,10 @@ export function autoApplyBGPalette(obar, requestMode) {
     if((themeDark == 'Select Theme' && requestMode == 'dark') ||
         (themeLight == 'Select Theme' && requestMode == 'light'))
         return;
+
+    // Pause stylesheet reloading, while auto-theme settings are updated, to prevent multiple style reloads
+    // (only after the early return above, otherwise reloading would stay paused forever)
+    obar._settings.set_boolean('pause-reload', true);
 
     // Save autotheme, to be applied, as 'theme'
     let theme;

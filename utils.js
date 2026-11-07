@@ -23,7 +23,7 @@
 // Brightness of color in terms of HSP value
 export function getHSP(color, g, b) {
     let r;
-    if(g)
+    if(g !== undefined) // note: g may legitimately be 0
         r = color;
     else
         [r, g, b] = [color[0], color[1], color[2]];

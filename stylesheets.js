@@ -32,6 +32,19 @@ if (Gio._promisify) {
     Gio._promisify(Gio.OutputStream.prototype, 'write_bytes_async', 'write_bytes_finish');
 }
 
+// Write text to a file (replace). Rejects on error, so callers can await + catch.
+async function writeFile(path, text) {
+    const file = Gio.File.new_for_path(path);
+    const bytearray = new TextEncoder().encode(text);
+    const stream = await file.replace_async(null, false, Gio.FileCreateFlags.NONE, GLib.PRIORITY_DEFAULT, null);
+    try {
+        await stream.write_bytes_async(bytearray, GLib.PRIORITY_DEFAULT, null);
+    }
+    finally {
+        stream.close(null);
+    }
+}
+
 const colorMix = Utils.colorMix;
 const colorBlend = Utils.colorBlend;
 const colorShade = Utils.colorShade;
@@ -40,7 +53,7 @@ const getBgDark = Utils.getBgDark;
 const rgbToHex = Utils.rgbToHex;
 
 // SVG for calendar event dot icon (use fg color)
-function saveCalEventSVG(obar, Me) {
+async function saveCalEventSVG(obar, Me) {
     let svg, svgpath, svgcolor;
     svg = `
     <svg width="32" height="32" xmlns="http://www.w3.org/2000/svg">
@@ -56,26 +69,17 @@ function saveCalEventSVG(obar, Me) {
 
     svg = svg.replace(`#REPLACE`, svgcolor);
 
-    let file = Gio.File.new_for_path(svgpath);
-    let bytearray = new TextEncoder().encode(svg);
-
     try {
-        file.replace_async(null, false, Gio.FileCreateFlags.NONE, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-            let stream = obj.replace_finish(res);
-            stream.write_bytes_async(bytearray, GLib.PRIORITY_DEFAULT, null, (w_obj, w_res) => {
-                w_obj.write_bytes_finish(w_res);
-                stream.close(null);
-            });
-        });
+        await writeFile(svgpath, svg);
     }
     catch(e) {
-      console.log("Failed to write calendar-today.svg file: " + svgpath, e);
+        console.error("Failed to write calendar-today.svg file: " + svgpath, e);
     }
 
 }
 
 // SVG for toggle switch (toggle On)
-function saveToggleSVG(type, obar, Me) {
+async function saveToggleSVG(type, obar, Me) {
     let svg, svgpath, svgFill = '', svgStroke = '', hc = '';
     svg =
     `<svg viewBox="0 0 44 26" xmlns="http://www.w3.org/2000/svg">
@@ -95,26 +99,17 @@ function saveToggleSVG(type, obar, Me) {
     }
     svg = svg.replace(`#HIGHCONTRAST`, hc);
 
-    let file = Gio.File.new_for_path(svgpath);
-    let bytearray = new TextEncoder().encode(svg);
-
     try {
-        file.replace_async(null, false, Gio.FileCreateFlags.NONE, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-            let stream = obj.replace_finish(res);
-            stream.write_bytes_async(bytearray, GLib.PRIORITY_DEFAULT, null, (w_obj, w_res) => {
-                w_obj.write_bytes_finish(w_res);
-                stream.close(null);
-            });
-        });
+        await writeFile(svgpath, svg);
     }
     catch(e) {
-      console.log("Failed to write toggle-on.svg file: " + svgpath, e);
+        console.error("Failed to write toggle-on.svg file: " + svgpath, e);
     }
 
 }
 
 // SVG for checkbox buttons (On, On-focused, Off-focused)
-function saveCheckboxSVG(type, obar, Me) {
+async function saveCheckboxSVG(type, obar, Me) {
     let svg, svgpath, svgFill = 'none', svgStroke = 'none';
     if(type == 'on') {
         svg = `
@@ -155,20 +150,11 @@ function saveCheckboxSVG(type, obar, Me) {
     svg = svg.replace(`#SVGFILL`, svgFill);
     svg = svg.replace(`#SVGSTROKE`, svgStroke);
 
-    let file = Gio.File.new_for_path(svgpath);
-    let bytearray = new TextEncoder().encode(svg);
-
     try {
-        file.replace_async(null, false, Gio.FileCreateFlags.NONE, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-            let stream = obj.replace_finish(res);
-            stream.write_bytes_async(bytearray, GLib.PRIORITY_DEFAULT, null, (w_obj, w_res) => {
-                w_obj.write_bytes_finish(w_res);
-                stream.close(null);
-            });
-        });
+        await writeFile(svgpath, svg);
     }
     catch(e) {
-      console.log("Failed to write checkbox-on/off.svg file: " + svgpath, e);
+        console.error("Failed to write checkbox-on/off.svg file: " + svgpath, e);
     }
 
 }
@@ -932,7 +918,7 @@ function createGtkCss(obar, gtk4) {
 }
 
 // Save Gtk stylesheet to user config dir
-export function saveGtkCss(obar, caller) {
+export async function saveGtkCss(obar, caller) {
     const importExport = obar._settings.get_boolean('import-export');
     const pauseStyleReload = obar._settings.get_boolean('pause-reload');
     if(importExport || pauseStyleReload)
@@ -943,7 +929,7 @@ export function saveGtkCss(obar, caller) {
     const configDir = GLib.get_user_config_dir();
     const gtk3Dir = Gio.File.new_for_path(`${configDir}/gtk-3.0`);
     const gtk4Dir = Gio.File.new_for_path(`${configDir}/gtk-4.0`);
-    [gtk3Dir, gtk4Dir].forEach(async (dir, idx) => {
+    await Promise.all([gtk3Dir, gtk4Dir].map(async (dir, idx) => {
         // console.log(dir.get_path() +'\n' + gtkstring);
 
         // Create dir if missing
@@ -981,7 +967,7 @@ export function saveGtkCss(obar, caller) {
         if(caller == 'disable' || !applyGtk) {
             if(isGtkOpenBar && isBackupOpenBar) {
                 try { // Restore backup
-                    backup.move_async(file, Gio.FileCopyFlags.OVERWRITE, null, null, null, null);
+                    await backup.move_async(file, Gio.FileCopyFlags.OVERWRITE, GLib.PRIORITY_DEFAULT, null, null);
                 }
                 catch (e) {
                     console.error('Error restoring gtk.css from backup: ' + e);
@@ -989,7 +975,7 @@ export function saveGtkCss(obar, caller) {
             }
             else if(isGtkOpenBar) {
                 try {
-                    file.delete_async(null, null, null);
+                    await file.delete_async(GLib.PRIORITY_DEFAULT, null);
                 }
                 catch (e) {
                     console.error('Error deleting OpenBar gtk.css: ' + e);
@@ -998,32 +984,40 @@ export function saveGtkCss(obar, caller) {
         }
         // Turn On Gtk: Backup if existing (non-openbar) gtk.css and create new OpenBar gtk.css
         else if(applyGtk) {
+            let movedToBackup = false;
             if(isGtk && !isGtkOpenBar) {
                 try {
-                    await file.move_async(backup, Gio.FileCopyFlags.OVERWRITE, null, null, null, null);
+                    await file.move_async(backup, Gio.FileCopyFlags.OVERWRITE, GLib.PRIORITY_DEFAULT, null, null);
+                    movedToBackup = true;
                 }
                 catch (e) {
                     console.error('Error backing up gtk.css: ' + e);
                 }
             }
 
+            // Extension was disabled while we were waiting: do not write OpenBar css anymore
+            // and put the user's original gtk.css back if we had just moved it away
+            if(!obar._settings) {
+                if(movedToBackup) {
+                    try {
+                        await backup.move_async(file, Gio.FileCopyFlags.OVERWRITE, GLib.PRIORITY_DEFAULT, null, null);
+                    }
+                    catch (e) {
+                        console.error('Error restoring gtk.css after disable: ' + e);
+                    }
+                }
+                return;
+            }
+
             // Create stylesheet string and save to css file
-            let gtkstring = createGtkCss(obar, idx);
-            let bytearray = new TextEncoder().encode(gtkstring);
             try {
-                file.replace_async(null, false, Gio.FileCreateFlags.NONE, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-                    let stream = obj.replace_finish(res);
-                    stream.write_bytes_async(bytearray, GLib.PRIORITY_DEFAULT, null, (w_obj, w_res) => {
-                        w_obj.write_bytes_finish(w_res);
-                        stream.close(null);
-                    });
-                });
+                await writeFile(file.get_path(), createGtkCss(obar, idx));
             }
             catch (e) {
-                console.log("Failed to write gtk.css file: " + dir.get_path() + e);
+                console.error("Failed to write gtk.css file: " + dir.get_path() + ' ' + e);
             }
         }
-    });
+    }));
 }
 
 // Apply override to provide flatpak apps access to Gtk config css files
@@ -3829,29 +3823,34 @@ async function writeStylesheet(obar, stylesheet) {
 }
 
 async function writeSVGs(obar, Me) {
+    const jobs = [];
+    const msWrote = obar.msSVG; // checkbox 'on-focused' is written below for accent changes
     if(obar.msSVG) { // Accent color is changed
-        saveToggleSVG('on', obar, Me);
-        saveToggleSVG('on-hc', obar, Me);
-        saveCheckboxSVG('on', obar, Me);
-        saveCheckboxSVG('on-focused', obar, Me);
+        jobs.push(saveToggleSVG('on', obar, Me));
+        jobs.push(saveToggleSVG('on-hc', obar, Me));
+        jobs.push(saveCheckboxSVG('on', obar, Me));
+        jobs.push(saveCheckboxSVG('on-focused', obar, Me));
         obar.msSVG = false;
     }
 
     if(obar.mhSVG) { // Highlight color is changed
-        saveCheckboxSVG('on-focused', obar, Me);
-        saveCheckboxSVG('off-focused', obar, Me);
+        if(!msWrote)
+            jobs.push(saveCheckboxSVG('on-focused', obar, Me)); // uses highlight color as stroke
+        jobs.push(saveCheckboxSVG('off-focused', obar, Me));
         obar.mhSVG = false;
     }
 
     if(obar.smfgSVG) { // Foreground color is changed
-        saveCalEventSVG(obar, Me);
+        jobs.push(saveCalEventSVG(obar, Me));
         obar.smfgSVG = false;
     }
+
+    await Promise.all(jobs);
 }
 
 async function writeGtkCss(obar) {
     if(obar.gtkCSS) { // accent or Gtk/Flatpak settings changed
-        saveGtkCss(obar, 'enable');
+        await saveGtkCss(obar, 'enable');
         obar.gtkCSS = false;
     }
 }
@@ -3870,6 +3869,10 @@ export async function reloadStyle(obar, Me) {
     catch(e) {
         console.log("Failed to reload stylesheet: ", e);
     }
+
+    // Extension may have been disabled while we were writing files
+    if(!obar._settings)
+        return;
 
     // Cause stylesheet to reload by toggling 'reloadstyle'
     let reloadstyle = obar._settings.get_boolean('reloadstyle');

@@ -28,7 +28,6 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
-import * as Calendar from 'resource:///org/gnome/shell/ui/calendar.js';
 import * as LayoutManager from 'resource:///org/gnome/shell/ui/layout.js';
 import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -58,7 +57,7 @@ class ConnectManager{
             sig: signal
         });
         // Remove obj on destroy except following that don't have destroy signal
-        if(!(obj instanceof Gio.Settings || obj instanceof LayoutManager.LayoutManager || obj instanceof Meta.WorkspaceManager | obj instanceof Meta.Display)) {
+        if(!(obj instanceof Gio.Settings || obj instanceof LayoutManager.LayoutManager || obj instanceof Meta.WorkspaceManager || obj instanceof Meta.Display)) {
             obj.connect('destroy', () => {
                 this.removeObject(obj)
             });
@@ -97,7 +96,28 @@ export default class Openbar extends Extension {
         this._intSettings = null;
         this._hcSettings = null;
         this._connections = null;
-        this._injections = [];
+        this._calendarInjection = null;
+        this._timers = new Map();
+    }
+
+    // Copy static assets (SVGs) from the extension dir to the runtime assets dir
+    async _copyAssets() {
+        const srcDir = Gio.File.new_for_path(`${this.path}/media/assets`);
+        const iter = srcDir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+        try {
+            const copies = [];
+            for(const fileInfo of iter) {
+                const name = fileInfo.get_name();
+                copies.push(srcDir.get_child(name).copy_async(
+                    this.obarAssetsDir.get_child(name),
+                    Gio.FileCopyFlags.OVERWRITE | Gio.FileCopyFlags.TARGET_DEFAULT_PERMS,
+                    GLib.PRIORITY_DEFAULT, null, null));
+            }
+            await Promise.all(copies);
+        }
+        finally {
+            iter.close(null);
+        }
     }
 
     // Generate a color palette from desktop background image
@@ -144,12 +164,15 @@ export default class Openbar extends Extension {
         const palette12 = cmap12? cmap12.palette() : null;
         const count12 = cmap12? cmap12.colorCounts() : null;
 
-        // Sort palette12 and count12 arrays by count descending
-        palette12?.sort((a, b) => count12[palette12.indexOf(b)] - count12[palette12.indexOf(a)]);
-        count12?.sort((a, b) => b - a);
-        // console.log('palette12 sorted ', palette12, 'count12 sorted ', count12);
+        if(!palette12 || !count12)
+            return [palette12, count12];
 
-        return [palette12, count12];
+        // Sort palette12 and count12 by count descending, keeping each color paired with its count
+        const sorted = palette12
+            .map((color, i) => ({color, count: count12[i]}))
+            .sort((a, b) => b.count - a.count);
+
+        return [sorted.map(s => s.color), sorted.map(s => s.count)];
     }
 
     backgroundPalette() {
@@ -216,20 +239,48 @@ export default class Openbar extends Extension {
         }
     }
 
+    // Wrap parent[name] so that func runs after the original. Returns a handle for _removeInjection().
     _injectToFunction(parent, name, func) {
-        let origin = parent[name];
-        parent[name] = function () {
-          let ret;
-          ret = origin.apply(this, arguments);
-          if (ret === undefined) ret = func.apply(this, arguments);
-          return ret;
+        const origin = parent[name];
+        const hadOwn = Object.prototype.hasOwnProperty.call(parent, name);
+        parent[name] = function (...args) {
+            const ret = origin.apply(this, args);
+            return ret === undefined ? func.apply(this, args) : ret;
         };
-        return origin;
+        return {parent, name, origin, hadOwn};
     }
 
-    _removeInjection(object, injection, name) {
-        if (injection[name] === undefined) delete object[name];
-        else object[name] = injection[name];
+    // Undo _injectToFunction on the very object it was applied to
+    _removeInjection(injection) {
+        if(!injection)
+            return;
+        if(injection.hadOwn)
+            injection.parent[injection.name] = injection.origin;
+        else
+            delete injection.parent[injection.name]; // falls back to the prototype method
+    }
+
+    // Named timers: starting a timer with an existing name replaces the old one,
+    // so no timer ID is ever lost and disable() can clear everything.
+    _setTimer(name, ms, fn) {
+        this._clearTimer(name);
+        this._timers.set(name, setTimeout(() => {
+            this._timers.delete(name);
+            fn();
+        }, ms));
+    }
+
+    _clearTimer(name) {
+        if(this._timers.has(name)) {
+            clearTimeout(this._timers.get(name));
+            this._timers.delete(name);
+        }
+    }
+
+    _clearAllTimers() {
+        for(const id of this._timers.values())
+            clearTimeout(id);
+        this._timers.clear();
     }
 
     unloadStylesheet() {
@@ -416,10 +467,9 @@ export default class Openbar extends Extension {
 
                             if(item.constructor.name === 'Calendar') {
                                 this.applyCalendarGridStyle(item, add);
-                                this.calendarTimeoutId = setTimeout(() => {
+                                this._setTimer('calendar', 250, () => {
                                     this.applyCalendarGridStyle(item, add);
-                                    this.calendarTimeoutId = null;
-                                }, 250);
+                                });
                             }
                         });
                       } catch(e) { console.log('OpenBar: DateMenu tree changed', e.message); }
@@ -1001,26 +1051,24 @@ export default class Openbar extends Extension {
             return;
 
         // Timeout to allow other extensions to move panel to another monitor
-        this.onFullScrTimeoutId =
-            setTimeout(() => {
-                // Check if panelBox is on the monitor which is in fullscreen
-                const LM = Main.layoutManager;
-                let panelBoxMonitor = this.getPanelMonitor()[0];
-                let panelFullMonFound = false;
-                for(const monitor of LM.monitors) {
-                    if(monitor.inFullscreen && monitor == panelBoxMonitor) {
-                        this.unloadStylesheet();
-                        this.isObarReset = true;
-                        panelFullMonFound = true;
-                        break;
-                    }
+        this._setTimer('fullscreen', timeout, () => {
+            // Check if panelBox is on the monitor which is in fullscreen
+            const LM = Main.layoutManager;
+            let panelBoxMonitor = this.getPanelMonitor()[0];
+            let panelFullMonFound = false;
+            for(const monitor of LM.monitors) {
+                if(monitor.inFullscreen && monitor == panelBoxMonitor) {
+                    this.unloadStylesheet();
+                    this.isObarReset = true;
+                    panelFullMonFound = true;
+                    break;
                 }
-                if(!panelFullMonFound && this.isObarReset) {
-                    this.loadStylesheet();
-                    this.isObarReset = false;
-                }
-                this.onFullScrTimeoutId = null;
-            }, timeout);
+            }
+            if(!panelFullMonFound && this.isObarReset) {
+                this.loadStylesheet();
+                this.isObarReset = false;
+            }
+        });
     }
 
     onModeChange() {
@@ -1037,10 +1085,9 @@ export default class Openbar extends Extension {
             return;
         }
         this.updatingBguri = true;
-        this.updatingBguriId = setTimeout(() => {
+        this._setTimer('updating-bguri', 5000, () => {
             this.updatingBguri = false;
-            this.updatingBguriId = null;
-        }, 5000);
+        });
         // console.log('==== Going ahead with bguri ====');
         let colorScheme = this._intSettings.get_string('color-scheme');
         if(colorScheme != this.colorScheme) {
@@ -1048,7 +1095,7 @@ export default class Openbar extends Extension {
             return;
         }
 
-        this.updateBguriId = setTimeout(() => {
+        this._setTimer('update-bguri', 200, () => {
             let bguriDark = this._bgSettings.get_string('picture-uri-dark');
             let bguriLight = this._bgSettings.get_string('picture-uri');
             this._settings.set_string('dark-bguri', bguriDark);
@@ -1068,8 +1115,7 @@ export default class Openbar extends Extension {
                 // console.log('bguriOld == bguriNew - calling updatePanelStyle for bguri');
                 this.updatePanelStyle(this._settings, 'bguri');
             }
-            this.updateBguriId = null;
-        }, 200);
+        });
     }
 
     // Connect multiple signals to ensure detecting background-change in all Gnome versions
@@ -1173,6 +1219,24 @@ export default class Openbar extends Extension {
 
         for(const idx of [0, 1]) {
             if((idx == 0 && !panel.leftFittsWidget) || (idx == 1 && !panel.rightFittsWidget)) {
+                // Get leftmost (idx 0) or rightmost (idx 1) visible button in the panel
+                const box = (idx == 0) ? this.panelBoxes[0] : this.panelBoxes[2];
+                if(!box)
+                    continue;
+                let btn = null;
+                for(const boxBtn of box) {
+                    if((boxBtn.child instanceof PanelMenu.Button ||
+                        boxBtn.child instanceof PanelMenu.ButtonBox) &&
+                        boxBtn.child.visible) {
+                        btn = boxBtn;
+                        if(idx == 0)
+                            break;
+                    }
+                }
+                // No visible button on this side: nothing to forward events to, so no corner widget
+                if(!btn)
+                    continue;
+
                 let widget = new St.Widget({
                     x: (idx == 0) ? panelBox.x : panelBox.x + panelBox.width - panel.x - panel._leftBox.x - 2, // 2 for border width
                     width: panel.x + panel._leftBox.x + 2,
@@ -1206,18 +1270,6 @@ export default class Openbar extends Extension {
                 panelBox.bind_property('y', widget, 'y', GObject.BindingFlags.SYNC_CREATE);
                 // Bind height of FittsWidget to params it depends on: panelBox.height
                 panelBox.bind_property('height', widget, 'height', GObject.BindingFlags.SYNC_CREATE);
-
-                // Get leftmost or rightmost visible button in the panel
-                let btn, box;
-                box = (idx == 0) ? this.panelBoxes[0] : this.panelBoxes[2];
-                for(const boxBtn of box) {
-                    if((boxBtn.child instanceof PanelMenu.Button ||
-                        boxBtn.child instanceof PanelMenu.ButtonBox) &&
-                        boxBtn.child.visible)
-                        btn = boxBtn;
-                        if(idx == 0)
-                            break;
-                }
 
                 // Connect signals for hover
                 widget.connect('enter-event', (actor, event) => {
@@ -1312,10 +1364,7 @@ export default class Openbar extends Extension {
     }
 
     updateFittsWidgetAddRemove(box, key, btn) {
-        if(this.fittsCornerTimeoutId) {
-            clearTimeout(this.fittsCornerTimeoutId);
-            this.fittsCornerTimeoutId = null;
-        }
+        this._clearTimer('fitts-corner');
         if(this.disabling) {
             return;
         }
@@ -1327,10 +1376,9 @@ export default class Openbar extends Extension {
             (btn == panel.leftCornerButton || btn == panel.rightCornerButton)) ) {
             this.destroyFittsCornerWidgets();
             // Wait for Panel to update its x, width then create CornerWidgets
-            this.fittsCornerTimeoutId = setTimeout(() => {
+            this._setTimer('fitts-corner', 500, () => {
                 this.createFittsCornerWidgets();
-                this.fittsCornerTimeoutId = null;
-            }, 500);
+            });
         }
 
         if(!(btn.child instanceof PanelMenu.Button || btn.child instanceof PanelMenu.ButtonBox))
@@ -1371,10 +1419,9 @@ export default class Openbar extends Extension {
     }
 
     postStartup() {
-        this.postStartupId = setTimeout(() => {
+        this._setTimer('post-startup', 2000, () => {
             this.setPanelStyle(null, 'post-startup');
-            this.postStartupId = null;
-        }, 2000);
+        });
     }
 
     enable() {
@@ -1396,16 +1443,10 @@ export default class Openbar extends Extension {
         this.isObarReset = false;
         this.addedSignal = this.gnomeVersion > 45? 'child-added': 'actor-added';
         this.removedSignal = this.gnomeVersion > 45? 'child-removed': 'actor-removed';
-        this.calendarTimeoutId = null;
-        this.bgMgrTimeOutId = null;
-        this.onFullScrTimeoutId = null;
         this.msgLists = [];
         this.msgListIds = [];
         this.styleUnloaded = false;
         this.updatingBguri = false;
-        this.updatingBguriId = null;
-        this.updateBguriId = null;
-        this.postStartupId = null;
         this.disabling = false;
 
         // Settings for desktop background image (set bg-uri as per color scheme)
@@ -1421,7 +1462,9 @@ export default class Openbar extends Extension {
         // this.bgalpha = this._settings.get_double('bgalpha');
         this._settings.set_boolean('import-export', false);
         this._settings.set_boolean('pause-reload', false);
-        this.savedAccentColor = this._intSettings.get_string('accent-color');
+        // 'accent-color' exists only from GNOME 47; reading a missing GSettings key aborts the shell
+        this.savedAccentColor = this._intSettings.settings_schema.has_key('accent-color')
+            ? this._intSettings.get_string('accent-color') : null;
 
         let panelMonitor = this.getPanelMonitor()[0];
         this._settings.set_int('monitor-height', panelMonitor.height);
@@ -1482,10 +1525,9 @@ export default class Openbar extends Extension {
             this.setupLibpanel(null, 'enabled', null, Main.panel.statusArea.quickSettings.menu);
 
         // Connect to background manager (give time for it to be available)
-        this.bgMgrTimeOutId = setTimeout(() => {
+        this._setTimer('bg-manager', 2000, () => {
             this.connectPrimaryBGChanged();
-            this.bgMgrTimeOutId = null;
-        }, 2000);
+        });
         // Set initial bguri as per color-scheme
         const bguri = this._settings.get_string('bguri');
         if(bguri == '')
@@ -1502,7 +1544,7 @@ export default class Openbar extends Extension {
         const obar = this;
         const calendar = Main.panel.statusArea?.dateMenu?._calendar;
         if(calendar) {
-            this._injections["_rebuildCalendar"] = this._injectToFunction(
+            this._calendarInjection = this._injectToFunction(
                 calendar,
                 "_rebuildCalendar",
                 function () {
@@ -1530,20 +1572,18 @@ export default class Openbar extends Extension {
                 console.error('Error creating OpenBar runtime/assets directory: ' + e);
             }
         }
-        // Copy static assets (SVGs) to runtime dir
-        const assetsSrcDir = Gio.File.new_for_path(`${this.path}/media/assets`);
-        const iter = assetsSrcDir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
-        for(const fileInfo of iter) {
-            let srcFile = Gio.File.new_for_path(`${assetsSrcDir.get_path()}/${fileInfo.get_name()}`);
-            let dstFile = Gio.File.new_for_path(`${this.obarAssetsDir.get_path()}/${fileInfo.get_name()}`);
-            srcFile.copy_async(dstFile, Gio.FileCopyFlags.OVERWRITE | Gio.FileCopyFlags.TARGET_DEFAULT_PERMS, GLib.PRIORITY_DEFAULT, null, null);
-        }
+        // Copy static assets (SVGs) to runtime dir. Must finish BEFORE the stylesheet/SVGs are
+        // generated below, otherwise the copy could overwrite the freshly colorized SVGs.
+        const assetsReady = this._copyAssets().catch(e => console.error('OpenBar: Error copying assets: ' + e));
 
         // Add 'openbar' class to top panel and panelBox
         panel.add_style_class_name('openbar');
         Main.layoutManager.panelBox.add_style_class_name('openbar');
         // Cause stylesheet to save and reload on Enable (also creates gtk css)
-        StyleSheets.reloadStyle(this, this);
+        assetsReady.then(() => {
+            if(this._settings)
+                return StyleSheets.reloadStyle(this, this);
+        }).catch(e => console.error('OpenBar: Error reloading style: ' + e));
         // Add Open Bar Flatpak Overrides
         StyleSheets.saveFlatpakOverrides(this, 'enable');
 
@@ -1552,11 +1592,10 @@ export default class Openbar extends Extension {
         let menustyle = this._settings.get_boolean('menustyle');
         this.applyMenuStyles(panel, menustyle);
         // Refresh to fix any indicators added during initial styling
-        this.enableStyleTimeoutId = setTimeout(() => {
+        this._setTimer('enable-style', 1000, () => {
             this.updatePanelStyle(null, 'enabled');
             this.applyMenuStyles(panel, menustyle);
-            this.enableStyleTimeoutId = null;
-        }, 1000);
+        });
 
         // Set initial Window Max Bar
         this.onWindowMaxBar();
@@ -1576,10 +1615,9 @@ export default class Openbar extends Extension {
         // Enable button proximity to interact with panel buttons without having to point precisely at them.
         const fittsWidgets = this._settings.get_boolean('fitts-widgets');
         if(fittsWidgets && !dtpOn)
-            this.fittsEnableTimeoutId = setTimeout(() => {
+            this._setTimer('fitts-enable', 5000, () => {
                 this.enableFittsWidgets();
-                this.fittsEnableTimeoutId = null;
-            }, 5000);
+            });
     }
 
     disable() {
@@ -1595,42 +1633,7 @@ export default class Openbar extends Extension {
 
         this.disconnectWindowSignals();
 
-        if(this.calendarTimeoutId > 0) {
-            clearTimeout(this.calendarTimeoutId);
-            this.calendarTimeoutId = null;
-        }
-        if(this.updatingBguriId > 0) {
-            clearTimeout(this.updatingBguriId);
-            this.updatingBguriId = null;
-        }
-        if(this.updateBguriId > 0) {
-            clearTimeout(this.updateBguriId);
-            this.updateBguriId = null;
-        }
-        if(this.bgMgrTimeOutId > 0) {
-            clearTimeout(this.bgMgrTimeOutId);
-            this.bgMgrTimeOutId = null;
-        }
-        if(this.onFullScrTimeoutId > 0) {
-            clearTimeout(this.onFullScrTimeoutId);
-            this.onFullScrTimeoutId = null;
-        }
-        if(this.postStartupId > 0) {
-            clearTimeout(this.postStartupId);
-            this.postStartupId = null;
-        }
-        if(this.enableStyleTimeoutId > 0) {
-            clearTimeout(this.enableStyleTimeoutId);
-            this.enableStyleTimeoutId = null;
-        }
-        if(this.fittsEnableTimeoutId > 0) {
-            clearTimeout(this.fittsEnableTimeoutId);
-            this.fittsEnableTimeoutId = null;
-        }
-        if(this.fittsCornerTimeoutId > 0) {
-            clearTimeout(this.fittsCornerTimeoutId);
-            this.fittsCornerTimeoutId = null;
-        }
+        this._clearAllTimers();
 
         for(let i=0; i<this.msgLists.length; i++) {
             if(this.msgListIds[i]) {
@@ -1644,8 +1647,8 @@ export default class Openbar extends Extension {
         this.msgLists = [];
         this.msgListIds = [];
 
-        this._removeInjection(Calendar.Calendar.prototype, this._injections, "_rebuildCalendar");
-        this._injections = [];
+        this._removeInjection(this._calendarInjection);
+        this._calendarInjection = null;
 
         // Remove style class from Panel and PanelBox
         Main.layoutManager.panelBox.remove_style_class_name('openbar');
