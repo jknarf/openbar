@@ -38,11 +38,16 @@ import * as StyleSheets from './stylesheets.js';
 if (Gio._promisify)
     Gio._promisify(Gio.File.prototype, "copy_async", "copy_finish");
 
+// Longest edge (in px) the wallpaper is scaled down to before its color palette is extracted.
+// A 12 color palette needs few pixels; sampling a full-size image blocks the shell's main thread.
+const PALETTE_IMAGE_SIZE = 200;
+
 // ConnectManager class to manage connections for events to trigger Openbar style updates
 // This class is modified from Floating Panel extension (Thanks Aylur!)
 class ConnectManager{
     constructor(list = []){
         this.connections = [];
+        this._destroyIds = new Map(); // obj -> id of its single 'destroy' handler
 
         list.forEach(c => {
             let [obj, signal, callback, callback_param] = c;
@@ -50,31 +55,46 @@ class ConnectManager{
         });
     }
 
-    connect(obj, signal, callback, callback_param){
+    // 'tag' is optional. It lets callers tell apart several connections to the same obj+signal
+    connect(obj, signal, callback, callback_param, tag = null){
         this.connections.push({
             id : obj.connect(signal, (object, signal_param) => {callback(object, signal, signal_param, callback_param)}),
             obj: obj,
-            sig: signal
+            sig: signal,
+            tag: tag
         });
-        // Remove obj on destroy except following that don't have destroy signal
-        if(!(obj instanceof Gio.Settings || obj instanceof LayoutManager.LayoutManager || obj instanceof Meta.WorkspaceManager || obj instanceof Meta.Display)) {
-            obj.connect('destroy', () => {
+        // Remove obj on destroy except following that don't have destroy signal.
+        // One 'destroy' handler per object is enough, however many signals are connected.
+        if(!(obj instanceof Gio.Settings || obj instanceof LayoutManager.LayoutManager || obj instanceof Meta.WorkspaceManager || obj instanceof Meta.Display)
+            && !this._destroyIds.has(obj)) {
+            this._destroyIds.set(obj, obj.connect('destroy', () => {
                 this.removeObject(obj)
-            });
+            }));
         }
+    }
+
+    // Connect only if obj+signal is not already connected with the same tag.
+    // For callers that run repeatedly (style refreshes, monitor changes) and must not pile up handlers.
+    connectOnce(tag, obj, signal, callback, callback_param){
+        if(this.connections.some(c => c.obj === obj && c.sig === signal && c.tag === tag))
+            return false;
+        this.connect(obj, signal, callback, callback_param, tag);
+        return true;
     }
 
     // remove an object WITHOUT disconnecting it, use only when you know the object is destroyed
     removeObject(object){
         this.connections = this.connections.filter(({id, obj, sig}) => obj != object);
+        this._destroyIds.delete(object);
     }
 
-    disconnect(object, signal){
-        let disconnections = this.connections.filter(({id, obj, sig}) => obj == object && sig == signal);
-        disconnections.forEach(c => {
+    // Disconnect obj+signal. With a tag, only the connections made with that tag, otherwise all of them
+    disconnect(object, signal, tag){
+        const matches = c => c.obj == object && c.sig == signal && (tag === undefined || c.tag === tag);
+        this.connections.filter(matches).forEach(c => {
             c.obj.disconnect(c.id);
         });
-        this.connections = this.connections.filter(({id, obj, sig}) => obj != object || sig != signal);
+        this.connections = this.connections.filter(c => !matches(c));
     }
 
     disconnectAll(){
@@ -82,7 +102,13 @@ class ConnectManager{
             // console.log('Disconnect All - c.id: ', c.id);
             if(c.obj && c.id > 0)
                 c.obj.disconnect(c.id);
-        })
+        });
+        this.connections = [];
+        for(const [obj, id] of this._destroyIds) {
+            if(obj && id > 0)
+                obj.disconnect(id);
+        }
+        this._destroyIds.clear();
     }
 }
 
@@ -122,57 +148,63 @@ export default class Openbar extends Extension {
 
     // Generate a color palette from desktop background image
     getPaletteFromImage(pictureUri) {
-        let pictureFile = Gio.File.new_for_uri(pictureUri);
+        try {
+            const path = Gio.File.new_for_uri(pictureUri).get_path();
+            if(!path) // not a local file
+                return [null, null];
 
-        // Load the image into a pixbuf
-        let pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(pictureFile.get_path(), 1000, -1);
-        let nChannels = pixbuf.n_channels;
+            // Load the image scaled down, the aspect ratio is kept
+            const pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(path, PALETTE_IMAGE_SIZE, PALETTE_IMAGE_SIZE);
+            const nChannels = pixbuf.n_channels;
+            const width = pixbuf.get_width();
+            const height = pixbuf.get_height();
+            // Rows can be padded to a multiple of 4 bytes, so rowstride is not always width * nChannels
+            const rowstride = pixbuf.get_rowstride();
 
-        // Get the width, height and pixel count of the image
-        let width = pixbuf.get_width();
-        let height = pixbuf.get_height();
-        let pixelCount = width*height;
-        let offset = 1;
+            // Get the pixel data as an array of bytes
+            const pixels = pixbuf.get_pixels();
 
-        // Get the pixel data as an array of bytes
-        let pixels = pixbuf.get_pixels();
+            const pixelArray = [];
+            // Loop through the pixels and get the rgba values
+            for (let y = 0; y < height; y++) {
+                for (let x = 0, index, r, g, b, a; x < width; x++) {
+                    index = y * rowstride + x * nChannels;
 
-        let pixelArray = [];
-        // Loop through the pixels and get the rgba values
-        for (let i = 0, index, r, g, b, a; i < pixelCount; i = i + offset) {
-            index = i * nChannels;
+                    // Get the red, green, blue, and alpha values
+                    r = pixels[index];
+                    g = pixels[index + 1];
+                    b = pixels[index + 2];
 
-            // Get the red, green, blue, and alpha values
-            r = pixels[index];
-            g = pixels[index + 1];
-            b = pixels[index + 2];
+                    a = nChannels==4? pixels[index + 3] : undefined;
 
-            a = nChannels==4? pixels[index + 3] : undefined;
-
-            // Save pixles that are not transparent and not full white/black
-            if (typeof a === 'undefined' || a >= 125) {
-                if (!(r > 250 && g > 250 && b > 250) && !(r < 5 && g < 5 && b < 5)) {
-                    pixelArray.push([r, g, b]);
-                    // pixelArray.push(Material.argbFromRgb(r, g, b));
+                    // Save pixles that are not transparent and not full white/black
+                    if (typeof a === 'undefined' || a >= 125) {
+                        if (!(r > 250 && g > 250 && b > 250) && !(r < 5 && g < 5 && b < 5)) {
+                            pixelArray.push([r, g, b]);
+                        }
+                    }
                 }
             }
+
+            // Generate color palette of 12 colors using Quantize to possibly get all colors for color-button
+            const cmap12 = Quantize.quantize(pixelArray, 12);
+            const palette12 = cmap12? cmap12.palette() : null;
+            const count12 = cmap12? cmap12.colorCounts() : null;
+
+            if(!palette12 || !count12)
+                return [palette12, count12];
+
+            // Sort palette12 and count12 by count descending, keeping each color paired with its count
+            const sorted = palette12
+                .map((color, i) => ({color, count: count12[i]}))
+                .sort((a, b) => b.count - a.count);
+
+            return [sorted.map(s => s.color), sorted.map(s => s.count)];
         }
-        // console.log('pixelCount, pixelarray len ', pixelCount, pixelArray.length);
-
-        // Generate color palette of 12 colors using Quantize to possibly get all colors for color-button
-        const cmap12 = Quantize.quantize(pixelArray, 12);
-        const palette12 = cmap12? cmap12.palette() : null;
-        const count12 = cmap12? cmap12.colorCounts() : null;
-
-        if(!palette12 || !count12)
-            return [palette12, count12];
-
-        // Sort palette12 and count12 by count descending, keeping each color paired with its count
-        const sorted = palette12
-            .map((color, i) => ({color, count: count12[i]}))
-            .sort((a, b) => b.count - a.count);
-
-        return [sorted.map(s => s.color), sorted.map(s => s.count)];
+        catch(e) {
+            console.error(`Openbar: Could not get palette from ${pictureUri}: ${e}`);
+            return [null, null];
+        }
     }
 
     backgroundPalette() {
@@ -355,20 +387,27 @@ export default class Openbar extends Extension {
     }
 
     // Add/Remove openmenu class to Notifications and Media message lists
-    // as well as to any other lists added by other extensions
+    // as well as to any other lists added by other extensions.
+    // Handlers are tracked per list object (not per index), so a list that gets replaced is never missed
     applySectionStyles(list, add) {
-        list.get_children().forEach((section, idx) => {
-            let msgList = section._list;
-            if(add && !this.msgListIds[idx]) {
-                this.msgListIds[idx] = msgList?.connect(this.addedSignal, (container, actor) => {
-                    this.applyMenuClass(actor.child, add);
-                });
-                this.msgLists[idx] = msgList;
-            }
-            else if(!add && this.msgListIds[idx]) {
-                msgList?.disconnect(this.msgListIds[idx]);
-                this.msgListIds[idx] = null;
-                this.msgLists[idx] = null;
+        list.get_children().forEach(section => {
+            const msgList = section._list;
+            if(msgList) {
+                if(add && !this._msgListIds.has(msgList)) {
+                    const addedId = msgList.connect(this.addedSignal, (container, actor) => {
+                        this.applyMenuClass(actor.child, add);
+                    });
+                    // A destroyed list takes its handlers with it, we only need to forget it
+                    const destroyId = msgList.connect('destroy', () => {
+                        this._msgListIds.delete(msgList);
+                    });
+                    this._msgListIds.set(msgList, [addedId, destroyId]);
+                }
+                else if(!add && this._msgListIds.has(msgList)) {
+                    for(const id of this._msgListIds.get(msgList))
+                        msgList.disconnect(id);
+                    this._msgListIds.delete(msgList);
+                }
             }
             msgList?.get_children().forEach(msg => {
                 this.applyMenuClass(msg.child, add);
@@ -428,12 +467,12 @@ export default class Openbar extends Extension {
                         const sectionList = msgScroll?.child;
                         if(sectionList) {
                             if(add) {
-                                this._connections.connect(sectionList, this.addedSignal, (container, actor) => {
+                                this._connections.connectOnce('menu-sections', sectionList, this.addedSignal, (container, actor) => {
                                     this.applySectionStyles(sectionList, add);
                                 });
                             }
                             else
-                                this._connections?.disconnect(sectionList, this.addedSignal);
+                                this._connections?.disconnect(sectionList, this.addedSignal, 'menu-sections');
                             this.applySectionStyles(sectionList, add);
                         }
 
@@ -855,10 +894,10 @@ export default class Openbar extends Extension {
             return;
 
         for(const panelColumn of menu.box.get_children()) {
-            this._connections.connect(panelColumn, this.addedSignal, this.updatePanelStyle.bind(this));
+            this._connections.connectOnce('libpanel-column', panelColumn, this.addedSignal, this.updatePanelStyle.bind(this));
         }
-        this._connections.connect(menu.box, this.addedSignal, (obj, signal, panelColumn, callbk_param) => {
-            this._connections.connect(panelColumn, this.addedSignal, this.updatePanelStyle.bind(this));
+        this._connections.connectOnce('libpanel-box', menu.box, this.addedSignal, (obj, signal, panelColumn, callbk_param) => {
+            this._connections.connectOnce('libpanel-column', panelColumn, this.addedSignal, this.updatePanelStyle.bind(this));
         });
     }
 
@@ -1016,17 +1055,18 @@ export default class Openbar extends Extension {
     onWindowMaxBar() {
         let wmaxbar = this._settings.get_boolean('wmaxbar');
         if(wmaxbar) {
+            this.disconnectWindowSignals(); // in case it was already active
             this._windowSignals = new Map();
             const windowActors = this.gnomeVersion < 48? global.get_window_actors() : global.compositor.get_window_actors();
             for(const window of windowActors){
                 this.onWindowAdded(null, 'enabled', window);
             }
-            this._connections.connect(global.window_group, this.addedSignal, this.onWindowAdded.bind(this));
-            this._connections.connect(global.window_group, this.removedSignal, this.onWindowRemoved.bind(this));
+            this._connections.connectOnce('window-added', global.window_group, this.addedSignal, this.onWindowAdded.bind(this));
+            this._connections.connectOnce('window-removed', global.window_group, this.removedSignal, this.onWindowRemoved.bind(this));
         }
         else {
-            this._connections.disconnect(global.window_group, this.addedSignal);
-            this._connections.disconnect(global.window_group, this.removedSignal);
+            this._connections.disconnect(global.window_group, this.addedSignal, 'window-added');
+            this._connections.disconnect(global.window_group, this.removedSignal, 'window-removed');
             this.disconnectWindowSignals();
             Main.panel.remove_style_pseudo_class('windowmax');
             this.setPanelBoxPosWindowMax(false);
@@ -1118,14 +1158,22 @@ export default class Openbar extends Extension {
         });
     }
 
-    // Connect multiple signals to ensure detecting background-change in all Gnome versions
+    // Connect multiple signals to ensure detecting background-change in all Gnome versions.
+    // Called on enable and on every monitors-changed, so it must be safe to call repeatedly
     connectPrimaryBGChanged() {
         const pMonitorIdx = Main.layoutManager.primaryIndex;
-        if(Main.layoutManager._bgManagers?.[pMonitorIdx])
-            this._connections.connect(Main.layoutManager._bgManagers[pMonitorIdx], 'changed', this.updateBguri.bind(this));
-        this._connections.connect(this._bgSettings, 'changed::picture-uri', this.updateBguri.bind(this));
-        this._connections.connect(this._bgSettings, 'changed::picture-uri-dark', this.updateBguri.bind(this));
-        this._connections.connect(this._intSettings, 'changed::color-scheme', this.updatePanelStyle.bind(this), 'color-scheme');
+        const bgManager = Main.layoutManager._bgManagers?.[pMonitorIdx];
+        // Background managers are recreated when monitors change: follow the new one, drop the old one
+        if(bgManager && bgManager !== this._bgManager) {
+            if(this._bgManager)
+                this._connections.disconnect(this._bgManager, 'changed', 'bg-manager');
+            this._bgManager = bgManager;
+            this._connections.connect(bgManager, 'changed', this.updateBguri.bind(this), undefined, 'bg-manager');
+        }
+        // Settings objects live as long as the extension: connect once only
+        this._connections.connectOnce('bg-uri', this._bgSettings, 'changed::picture-uri', this.updateBguri.bind(this));
+        this._connections.connectOnce('bg-uri-dark', this._bgSettings, 'changed::picture-uri-dark', this.updateBguri.bind(this));
+        this._connections.connectOnce('bg-scheme', this._intSettings, 'changed::color-scheme', this.updatePanelStyle.bind(this), 'color-scheme');
     }
 
     createFittsWidget(box, btn) {
@@ -1355,9 +1403,9 @@ export default class Openbar extends Extension {
             for(const btn of box) {
                 if(btn.child instanceof PanelMenu.Button || btn.child instanceof PanelMenu.ButtonBox) {
                     if(connect)
-                        this._connections.connect(btn.child, 'notify::visible', this.updateFittsWidgetVisible.bind(this, btn));
+                        this._connections.connectOnce('fitts-visible', btn.child, 'notify::visible', this.updateFittsWidgetVisible.bind(this, btn));
                     else
-                        this._connections.disconnect(btn.child, 'notify::visible');
+                        this._connections.disconnect(btn.child, 'notify::visible', 'fitts-visible');
                 }
             }
         }
@@ -1385,7 +1433,7 @@ export default class Openbar extends Extension {
             return;
 
         if(key == this.addedSignal) {
-            this._connections.connect(btn.child, 'notify::visible', this.updateFittsWidgetVisible.bind(this, btn));
+            this._connections.connectOnce('fitts-visible', btn.child, 'notify::visible', this.updateFittsWidgetVisible.bind(this, btn));
             if(btn.child.visible)
                 this.createFittsWidget(box, btn);
         }
@@ -1396,12 +1444,12 @@ export default class Openbar extends Extension {
     connectFittsWidgetAddRemove(connect) {
         for(const box of this.panelBoxes) {
             if(connect) {
-                this._connections.connect(box, this.addedSignal, this.updateFittsWidgetAddRemove.bind(this));
-                this._connections.connect(box, this.removedSignal, this.updateFittsWidgetAddRemove.bind(this));
+                this._connections.connectOnce('fitts-box-added', box, this.addedSignal, this.updateFittsWidgetAddRemove.bind(this));
+                this._connections.connectOnce('fitts-box-removed', box, this.removedSignal, this.updateFittsWidgetAddRemove.bind(this));
             }
             else {
-                this._connections.disconnect(box, this.addedSignal);
-                this._connections.disconnect(box, this.removedSignal);
+                this._connections.disconnect(box, this.addedSignal, 'fitts-box-added');
+                this._connections.disconnect(box, this.removedSignal, 'fitts-box-removed');
             }
         }
     }
@@ -1443,8 +1491,8 @@ export default class Openbar extends Extension {
         this.isObarReset = false;
         this.addedSignal = this.gnomeVersion > 45? 'child-added': 'actor-added';
         this.removedSignal = this.gnomeVersion > 45? 'child-removed': 'actor-removed';
-        this.msgLists = [];
-        this.msgListIds = [];
+        this._msgListIds = new Map();
+        this._bgManager = null;
         this.styleUnloaded = false;
         this.updatingBguri = false;
         this.disabling = false;
@@ -1635,17 +1683,12 @@ export default class Openbar extends Extension {
 
         this._clearAllTimers();
 
-        for(let i=0; i<this.msgLists.length; i++) {
-            if(this.msgListIds[i]) {
-                // console.log('Disable - msgListIds: ', this.msgListIds[i]);
-                if(this.msgLists[i] && this.msgListIds[i] > 0)
-                    this.msgLists[i].disconnect(this.msgListIds[i]);
-                this.msgListIds[i] = null;
-                this.msgLists[i] = null;
-            }
+        for(const [msgList, ids] of this._msgListIds) {
+            for(const id of ids)
+                msgList.disconnect(id);
         }
-        this.msgLists = [];
-        this.msgListIds = [];
+        this._msgListIds.clear();
+        this._bgManager = null;
 
         this._removeInjection(this._calendarInjection);
         this._calendarInjection = null;

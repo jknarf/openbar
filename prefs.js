@@ -54,6 +54,13 @@ export default class OpenbarPreferences extends ExtensionPreferences {
 
 class OpenbarPrefs {
 
+    // Connect a handler to settings and remember its id, so it can be disconnected when the window closes
+    _connectSetting(...args) {
+        const id = this._settings.connect(...args);
+        this._settingsIds.push(id);
+        return id;
+    }
+
     // Trigger creation and application of auto-theme from background
     triggerAutoTheme() {
         // Cause autotheme to apply by toggling 'trigger-autotheme'
@@ -105,7 +112,7 @@ class OpenbarPrefs {
                     this._settings.set_string(gsetting, options[sel][0]);
             });
 
-            this._settings.connect(`changed::${gsetting}`, () => {
+            this._connectSetting(`changed::${gsetting}`, () => {
                 let activeId = this._settings.get_string(gsetting);
                 let idx = options.findIndex(o => o[0] === activeId);
                 if(idx >= 0 && idx !== dropDown.get_selected())
@@ -372,6 +379,7 @@ class OpenbarPrefs {
 
         // Get the settings object
         this._settings = openbar.getSettings();
+        this._settingsIds = [];
 
         let mWidth = this._settings.get_int('monitor-width');
         let mHeight = this._settings.get_int('monitor-height');
@@ -394,8 +402,6 @@ class OpenbarPrefs {
         // console.log('fillOpenbarPrefs: loadQuotesFromFile');
         this.loadQuotesFromFile();
 
-        // Get the settings object
-        this._settings = openbar.getSettings();
         // Connect settings to update/save/reload stylesheet
         let settEvents = ['bartype', 'position', 'font', 'gradient', 'wmax-hbarhint', 'cust-margin-wmax', 'border-wmax', 'neon-wmax',
         'buttonbg-wmax', 'gradient-direction', 'shadow', 'neon', 'heffect', 'smbgoverride', 'mbg-gradient', 'autofg-bar', 'autofg-menu',
@@ -403,11 +409,11 @@ class OpenbarPrefs {
         'radius-bottomleft', 'radius-bottomright', 'apply-menu-notif', 'apply-menu-shell', 'apply-accent-shell', 'apply-all-shell',
         'dashdock-style', 'dborder', 'dshadow', 'set-overview', 'set-bottom-margin'];
         settEvents.forEach(event => {
-            this._settings.connect('changed::'+event, () => {this.triggerStyleReload();});
+            this._connectSetting('changed::'+event, () => {this.triggerStyleReload();});
         });
 
         // Update palette in preferences window on background change
-        this._settings.connect('changed::bg-change', () => {
+        this._connectSetting('changed::bg-change', () => {
             this.updatePalette(window, false);
         });
 
@@ -1272,7 +1278,7 @@ class OpenbarPrefs {
         );
 
         // Update font widget when font changed from settings (due to import file)
-        this._settings.connect('changed::font', () => {
+        this._connectSetting('changed::font', () => {
             let font = obar._settings.get_string('font');
             fontBtn.set_font_desc(Pango.FontDescription.from_string(font));
         });
@@ -2845,6 +2851,17 @@ class OpenbarPrefs {
                 clearTimeout(this.quoteTimeoutId);
                 this.quoteTimeoutId = null;
             }
+            if(this.timeoutId) {
+                clearTimeout(this.timeoutId);
+                this.timeoutId = null;
+            }
+            for(const id of this._settingsIds)
+                this._settings.disconnect(id);
+            this._settingsIds = [];
+            if(this.cssProvider) {
+                Gtk.StyleContext.remove_provider_for_display(Gdk.Display.get_default(), this.cssProvider);
+                this.cssProvider = null;
+            }
         });
 
     }
@@ -2863,12 +2880,18 @@ class OpenbarPrefs {
                 let response = dialog.choose_finish(task);
                 if (response === 1) {
                     this._settings.set_boolean('import-export', true);
-                    let keys = this._settings.list_keys();
-                    let keysToKeep = ['import-export', 'default-font', 'bguri', 'dark-bguri', 'light-bguri'];
-                    keys.forEach(k => { if(!keysToKeep.includes(k)) this._settings.reset(k); });
-                    this._settings.set_boolean('import-export', false);
+                    try {
+                        let keys = this._settings.list_keys();
+                        let keysToKeep = ['import-export', 'default-font', 'bguri', 'dark-bguri', 'light-bguri'];
+                        keys.forEach(k => { if(!keysToKeep.includes(k)) this._settings.reset(k); });
+                    }
+                    finally {
+                        this._settings.set_boolean('import-export', false);
+                    }
                 }
-            } catch(e) {}
+            } catch(e) {
+                this._logDialogError(e);
+            }
         });
     }
 
@@ -2915,6 +2938,15 @@ class OpenbarPrefs {
         // console.log('QUTES: ' + this.quotes);
     }
 
+    // Log errors, but stay quiet when the user just dismissed a dialog
+    _logDialogError(e) {
+        if(e instanceof GLib.Error &&
+           (e.matches(Gtk.DialogError, Gtk.DialogError.DISMISSED) ||
+            e.matches(Gtk.DialogError, Gtk.DialogError.CANCELLED)))
+            return;
+        console.error('OpenBar prefs: ' + e);
+    }
+
     importSettings(window) {
         let fileDialog = new Gtk.FileDialog({
             title: _("Import Settings for Open Bar Theme"),
@@ -2935,7 +2967,7 @@ class OpenbarPrefs {
                             null,
                             ['dconf', 'load', SCHEMA_PATH],
                             null,
-                            GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD,
+                            GLib.SpawnFlags.SEARCH_PATH, // child is reaped by GLib (DO_NOT_REAP_CHILD without a watch leaves a zombie)
                             null
                         );
 
@@ -2954,7 +2986,11 @@ class OpenbarPrefs {
                         this.triggerStyleReload();
                     }, 3000);
                 }
-            } catch(e) {}
+            } catch(e) {
+                // Never leave 'import-export' set, it blocks all style updates in the extension
+                this._settings.set_boolean('import-export', false);
+                this._logDialogError(e);
+            }
         });
     }
 
@@ -2980,7 +3016,11 @@ class OpenbarPrefs {
                 out.write_all(GLib.spawn_command_line_sync(`dconf dump ${SCHEMA_PATH}`)[1], null);
                 out.close(null);
                 setTimeout(() => {this._settings.set_boolean('import-export', false)}, 1000);
-            } catch(e) {}
+            } catch(e) {
+                // Never leave 'import-export' set, it blocks all style updates in the extension
+                this._settings.set_boolean('import-export', false);
+                this._logDialogError(e);
+            }
         });
     }
 
